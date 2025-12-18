@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 import networkx as nx
+import os
+import argparse
 
 # Utility Functions
 def sigmoid(x):
@@ -49,7 +51,7 @@ class DataSimulator:
         for r in range(self.n_regions):
             base_rate = float(self.rng.uniform(0.2, 3.0))
             base_price = float(self.rng.uniform(1.0, 3.0))
-            elasticity = float(self.rng.uniform(-1.5, -2.0))
+            elasticity = float(self.rng.uniform(-2.0, -1.5))
             rows. append({
                 "region_id": int(r),
                 "base_rate": base_rate,
@@ -61,7 +63,8 @@ class DataSimulator:
         return self.region_baselines
     
     def generate_region_graph(self, k_neighbors=2, edge_prob=0.3):
-        G = nx.watts_strogatz_graph(n=self.n_regions, k=k_neighbors, p=edge_prob, seed=self.rng.integers(1<<30))
+        seed_val = int(self.rng.integers(1<<30))
+        G = nx.watts_strogatz_graph(n=self.n_regions, k=k_neighbors, p=edge_prob, seed=seed_val)
         edges = []
         for a,b in G.edges():
             w = float(self.rng.uniform(0.1,1.0))
@@ -170,15 +173,34 @@ class DataSimulator:
         self.region_graph = pd.DataFrame(edges)
         return self.region_graph, k_list  # returning k_list is useful for diagnostics
     
+    # def simulate_time_index(self):
+    #     self.time_index = pd.date_range(start=self.start, end=self.end, freq=self.freq, closed='left')
+    #     return self.time_index
+
     def simulate_time_index(self):
-        self.time_index = pd.date_range(start=self.start, end=self.end, freq=self.freq, closed='left')
+        """
+        Create a DatetimeIndex from start (inclusive) to end (exclusive) with frequency self.freq.
+        Some pandas versions don't support the 'closed' argument, so we create the full range
+        and then remove any timestamps >= self.end to emulate closed='left'.
+        """
+        # generate candidate range (may include the end)
+        idx = pd.date_range(start=self.start, end=self.end, freq=self.freq)
+
+        # keep only timestamps strictly less than end to emulate closed='left'
+        idx = idx[idx < self.end]
+
+        # if idx is empty for some corner cases, ensure at least the start is present
+        if len(idx) == 0:
+            idx = pd.DatetimeIndex([self.start])
+
+        self.time_index = idx
         return self.time_index
     
     def simulate_region_level_rates(self):
-        if self.region_baselines == None:
+        if self.region_baselines is None:
             self.generate_region_baselines()
 
-        if self.time_index == None:
+        if self.time_index is None:
             self.simulate_time_index()
 
         rows = []
@@ -201,8 +223,8 @@ class DataSimulator:
                 # allocate drivers randomly but stable
                 rows.append({
                     "ts": ts,
-                    "region_id": rid
-                    "lambda": lam,
+                    "region_id": rid,
+                    "rate": lam,
                     "supply": int(max(1, np.round(self.n_drivers * (1.0/self.n_regions) * (1.0 + self.rng.normal(0,0.2)))))
                 })
 
@@ -211,7 +233,7 @@ class DataSimulator:
     
     def simulate_events(self, subsidy_arms=[0.0, 0.5, 1.0], max_requests=None):
         """
-        Simulate per-request attempts sampled from Poisson(lambda) at each (ts, region).
+        Simulate per-request attempts sampled from Poisson(rate) at each (ts, region).
         For each request:
          - assign rider_id randomly
          - sample offered price = base_price * (1 + surge)  (surge depends on supply/demand)
@@ -236,7 +258,7 @@ class DataSimulator:
         for _, rr in self.region_rates.iterrows():
             ts = rr['ts']
             region = rr['region_id']
-            lam = rr['lambda']
+            lam = rr['rate']
             supply = rr['supply']
 
             n_req = int(self.rng.poisson(lam))
@@ -268,7 +290,7 @@ class DataSimulator:
                 rider_propensity = float(self.rng.normal(0, 0.5))
                 context_score = rider_propensity + self.rng.normal(0, 0.1)
                 conversion_prob = price_to_conversion_prob(final_price, base_price, elasticity_map[region], context_score)
-                is_trip = int(self.rng.random < conversion_prob)
+                is_trip = int(self.rng.random() < conversion_prob)
                 revenue = final_price if is_trip else 0.0
                 events.append({
                     "event_id": eid,
@@ -288,4 +310,130 @@ class DataSimulator:
                 })
 
         events_df = pd.DataFrame(events)
-        
+
+        if not events_df.empty:
+            events_df.sort_values(['ts', 'region_id'], inplace=True)
+            # supply constraints per (ts, region)
+            def assign_drivers(group):
+                supply = int(group.iloc[0]['region_id'])  # placeholder -> we'll map supply from region_rates
+                # real supply from region_rates:
+                ts = group.name[0]
+                region = group.name[1]
+                supply_row = self.region_rates[(self.region_rates.ts == ts) & (self.region_rates.region_id == region)]
+                supply = int(supply_row['supply'].iloc[0]) if not supply_row.empty else 1
+                # find trip requests
+                trip_idx = group[group.is_trip == 1].index.tolist()
+                # cap by supply
+                assigned = trip_idx[:supply]
+                # assign driver ids randomly from pool allocated for region
+                drivers_pool = list(range(region * 1000, region * 1000 + supply))
+                for i, idx in enumerate(assigned):
+                    group.at[idx, 'driver_id'] = drivers_pool[i % max(1,len(drivers_pool))]
+                # for trip requests beyond supply -> mark is_trip to 0 (unmatched)
+                for idx in trip_idx[supply:]:
+                    group.at[idx, 'is_trip'] = 0
+                    group.at[idx, 'driver_id'] = -1
+                    group.at[idx, 'revenue'] = 0.0
+                return group
+
+            # group by ts & region and assign
+            events_df = events_df.groupby(['ts', 'region_id'], group_keys=False).apply(assign_drivers).reset_index(drop=True)
+
+        # store
+        self.events = events_df
+        return self.events
+    
+    # Save helpers
+    def save_events_csv(self, path):
+        if self.events is None:
+            raise RuntimeError("No events generated yet. Call simulate_events() first.")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.events.to_csv(path, index=False)
+        print(f"[INFO] saved events to {path}")
+
+    # def save_region_graph(self, path):
+    #     if self.region_graph is None:
+    #         raise RuntimeError("No region graph. Call generate_region_graph() first.")
+    #     os.makedirs(os.path.dirname(path), exist_ok=True)
+    #     self.region_graph.to_csv(path, index=False)
+    #     print(f"[INFO] saved region graph to {path}")
+
+    def save_region_graph(self, path):
+        """
+        Save region graph to CSV. Accepts either a DataFrame or a list-of-dicts
+        (defensive: converts list -> DataFrame).
+        """
+        if self.region_graph is None:
+            raise RuntimeError("No region graph. Call generate_region_graph() first.")
+        # Accept list-of-dicts or DataFrame
+        rg = self.region_graph
+        if isinstance(rg, list):
+            try:
+                rg = pd.DataFrame(rg)
+            except Exception as e:
+                raise RuntimeError("region_graph is a list but could not convert to DataFrame") from e
+        elif not isinstance(rg, pd.DataFrame):
+            # try to coerce into DataFrame for safety
+            rg = pd.DataFrame(rg)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rg.to_csv(path, index=False)
+        print(f"[INFO] saved region graph to {path}")
+        # also keep the normalized DataFrame on the object for later use
+        self.region_graph = rg
+
+    def save_region_baselines(self, path):
+        if self.region_baselines is None:
+            raise RuntimeError("No region baselines. Call generate_region_baselines() first.")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.region_baselines.to_csv(path, index=False)
+        print(f"[INFO] saved region baselines to {path}")
+
+    
+# ---------------------
+# CLI
+# ---------------------
+def main(args):
+    sim = DataSimulator(
+        n_regions=args.n_regions,
+        n_riders=args.n_riders,
+        n_drivers=args.n_drivers,
+        start=args.start,
+        end=args.end,
+        freq=args.freq,
+        seed=args.seed
+    )
+    print("[INFO] generating region baselines...")
+    sim.generate_region_baselines()
+    sim.save_region_baselines(os.path.join(args.out_dir, "region_baselines.csv"))
+
+    print("[INFO] generating region graph...")
+    sim.generate_region_graph(k_neighbors=args.k_neighbors, edge_prob=args.edge_prob)
+    sim.save_region_graph(os.path.join(args.out_dir, "region_graph.csv"))
+
+    print("[INFO] generating time index & region-level rates...")
+    sim.simulate_time_index()
+    sim.simulate_region_level_rates()
+
+    print("[INFO] simulating events...")
+    sim.simulate_events(subsidy_arms=args.subsidy_arms, max_requests=args.max_requests)
+    events_path = os.path.join(args.out_dir, "events.csv")
+    sim.save_events_csv(events_path)
+    print("[DONE] data generation complete. events:", sim.events.shape[0])
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out_dir", type=str, default="data", help="output directory")
+    parser.add_argument("--n_regions", type=int, default=10)
+    parser.add_argument("--n_riders", type=int, default=500)
+    parser.add_argument("--n_drivers", type=int, default=200)
+    parser.add_argument("--start", type=str, default="2025-12-01T00:00:00")
+    parser.add_argument("--end", type=str, default="2025-12-02T00:00:00")
+    parser.add_argument("--freq", type=str, default="5min")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--k_neighbors", type=int, default=2)
+    parser.add_argument("--edge_prob", type=float, default=0.3)
+    parser.add_argument("--subsidy_arms", nargs='+', type=float, default=[0.0, 0.5, 1.0])
+    parser.add_argument("--max_requests", type=int, default=None, help="cap per (ts,region)")
+    args = parser.parse_args()
+    main(args)
