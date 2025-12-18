@@ -222,4 +222,70 @@ class DataSimulator:
         Returns DataFrame events
         """
 
-        if self.
+        if self.region_rates is None:
+            self.simulate_region_level_rates()
+        if self.region_baselines is None:
+            self.generate_region_baselines()
+
+        events = []
+        eid = 0
+
+        base_price_map = dict(self.region_baselines.set_index('region_id')['base_price'])
+        elasticity_map = dict(self.region_baselines.set_index('region_id')['elasticity'])
+
+        for _, rr in self.region_rates.iterrows():
+            ts = rr['ts']
+            region = rr['region_id']
+            lam = rr['lambda']
+            supply = rr['supply']
+
+            n_req = int(self.rng.poisson(lam))
+
+            if max_requests is not None and n_req > max_requests:
+                n_req = max_requests
+            if n_req == 0:
+                continue
+
+            # surge factor: simple function of demand/supply ratio
+            # expected demand in this window = lam; current supply = supply
+            # surge_multiplier = 1 + gamma * max(0, (demand - supply)/supply)
+
+            gamma = 0.5
+            surge_mul = 1 + gamma * max(0, (lam - supply) / (supply + 1e-9))
+
+            # for each request
+            for _ in range(n_req):
+                eid += 1
+                rider_id = int(self.rng.integers(0, self.n_riders))
+                # assign a driver later when is_trip is true
+                driver_id = -1 # placeholder for when we match later
+                base_price = base_price_map[region]
+                proposed_price = float(base_price * surge_mul)
+                # choose a subsidy arm uniformly
+                subsidy = float(self.rng.choice(subsidy_arms, p=None))
+                final_price = apply_subsidy(proposed_price, subsidy)
+                # context score: a small vector for rider propensity and time effect
+                rider_propensity = float(self.rng.normal(0, 0.5))
+                context_score = rider_propensity + self.rng.normal(0, 0.1)
+                conversion_prob = price_to_conversion_prob(final_price, base_price, elasticity_map[region], context_score)
+                is_trip = int(self.rng.random < conversion_prob)
+                revenue = final_price if is_trip else 0.0
+                events.append({
+                    "event_id": eid,
+                    "ts": ts,
+                    "region_id": region,
+                    "rider_id": rider_id,
+                    "driver_id": driver_id,
+                    "base_price": round(base_price, 3),
+                    "surge_multiplier": round(float(surge_mul), 4),
+                    "proposed_price": round(proposed_price, 3),
+                    "subsidy": round(subsidy, 3),
+                    "final_price": round(final_price, 3),
+                    "context_score": round(context_score, 4),
+                    "conversion_prob": round(float(conversion_prob), 6),
+                    "is_trip": is_trip,
+                    "revenue": round(float(revenue), 3)
+                })
+
+        events_df = pd.DataFrame(events)
+        
